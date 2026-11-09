@@ -489,6 +489,56 @@ void foc_run_pid_control_pos(bool index_found, float dt, motor_all_state_t *moto
 	}
 }
 
+bool foc_hall_speed_selected(const mc_configuration *conf) {
+	return conf->foc_sensor_mode == FOC_SENSOR_MODE_HALL &&
+			conf->foc_speed_soure == FOC_SPEED_SRC_CORRECTED &&
+			conf->s_pid_speed_source == S_PID_SPEED_SRC_FAST;
+}
+
+float foc_selected_speed(const motor_all_state_t *motor) {
+	if (foc_hall_speed_selected(motor->m_conf) && !motor->m_phase_override) {
+		if (!motor->m_speed_source.initialized) {
+			return RADPS2RPM_f(motor->m_pll_speed);
+		}
+		// Use the latest estimates, not values cached before this ADC's PLL
+		// update. Hall validity/acquisition must not gate PLL feedback.
+		float blend = motor->m_speed_source.fast_blend;
+		if (blend <= 0.0f) {
+			return RADPS2RPM_f(motor->m_pll_speed);
+		}
+		if (blend >= 1.0f) {
+			return RADPS2RPM_f(motor->m_speed_est_fast);
+		}
+		return RADPS2RPM_f(motor->m_pll_speed +
+				blend * (motor->m_speed_est_fast - motor->m_pll_speed));
+	}
+	switch (motor->m_conf->s_pid_speed_source) {
+	case S_PID_SPEED_SRC_FAST:
+		return RADPS2RPM_f(motor->m_speed_est_fast);
+	case S_PID_SPEED_SRC_FASTER:
+		return RADPS2RPM_f(motor->m_speed_est_faster);
+	default:
+		return RADPS2RPM_f(motor->m_pll_speed);
+	}
+}
+
+static bool speed_gain_schedule_active(const motor_all_state_t *motor) {
+	return foc_hall_speed_selected(motor->m_conf) && !motor->m_phase_override &&
+			motor->m_speed_source.initialized;
+}
+
+void foc_speed_pid_gains(const motor_all_state_t *motor, float *kp, float *kd) {
+	*kp = motor->m_conf->s_pid_kp;
+	*kd = motor->m_conf->s_pid_kd;
+	if (speed_gain_schedule_active(motor)) {
+		*kp += motor->m_speed_gain_weight * (HALL_FAST_PID_KP - *kp);
+		// Also keep D disabled throughout the return blend to PLL.
+		if (motor->m_speed_source.fast_mode || motor->m_speed_source.fast_blend > 0.0f) {
+			*kd = 0.0f;
+		}
+	}
+}
+
 void foc_run_pid_control_speed(bool index_found, float dt, motor_all_state_t *motor) {
 	mc_configuration *conf_now = motor->m_conf;
 	float p_term;
@@ -499,6 +549,8 @@ void foc_run_pid_control_speed(bool index_found, float dt, motor_all_state_t *mo
 		motor->m_speed_i_term = 0.0;
 		motor->m_speed_prev_error = 0.0;
 		motor->m_speed_d_filter = 0.0;
+		motor->m_speed_gain_weight = 0.0f;
+		motor->m_speed_gain_active = false;
 		return;
 	}
 
@@ -515,18 +567,7 @@ void foc_run_pid_control_speed(bool index_found, float dt, motor_all_state_t *mo
 		}
 	}
 
-	float rpm = 0.0;
-	switch (conf_now->s_pid_speed_source) {
-	case S_PID_SPEED_SRC_PLL:
-		rpm = RADPS2RPM_f(motor->m_pll_speed);
-		break;
-	case S_PID_SPEED_SRC_FAST:
-		rpm = RADPS2RPM_f(motor->m_speed_est_fast);
-		break;
-	case S_PID_SPEED_SRC_FASTER:
-		rpm = RADPS2RPM_f(motor->m_speed_est_faster);
-		break;
-	}
+	float rpm = foc_selected_speed(motor);
 
 	float error = motor->m_speed_pid_set_rpm - rpm;
 
@@ -534,16 +575,49 @@ void foc_run_pid_control_speed(bool index_found, float dt, motor_all_state_t *mo
 	if (fabsf(motor->m_speed_pid_set_rpm) < conf_now->s_pid_min_erpm) {
 		motor->m_speed_i_term = 0.0;
 		motor->m_speed_prev_error = error;
+		motor->m_speed_gain_weight = 0.0f;
+		motor->m_speed_gain_active = false;
 		motor->m_iq_set = 0.0;
 		return;
 	}
 
-	// Compute parameters
-	p_term = error * conf_now->s_pid_kp * (1.0 / 20.0);
-	d_term = (error - motor->m_speed_prev_error) * (conf_now->s_pid_kd / dt) * (1.0 / 20.0);
+	bool scheduled = speed_gain_schedule_active(motor);
+	float target_weight = 0.0f;
+	if (scheduled) {
+		float start = conf_now->foc_sl_erpm + HALL_FAST_ENTER_MARGIN_ERPM;
+		float span = fmaxf(HALL_FAST_PID_FULL_ERPM - start, 1.0f);
+		target_weight = (fabsf(RADPS2RPM_f(motor->m_pll_speed)) - start) / span;
+		utils_truncate_number(&target_weight, 0.0f, 1.0f);
+		target_weight *= motor->m_speed_source.fast_blend;
+		utils_step_towards(&motor->m_speed_gain_weight, target_weight,
+				dt / HALL_FAST_PID_GAIN_SECONDS);
+	} else {
+		motor->m_speed_gain_weight = 0.0f;
+	}
+	float kp, kd;
+	foc_speed_pid_gains(motor, &kp, &kd);
 
-	// Filter D
-	UTILS_LP_FAST(motor->m_speed_d_filter, d_term, conf_now->s_pid_kd_filter);
+	// Cancel only coefficient changes, not real error changes. Keep the
+	// integrator in output units, so changing gains does not rescale its state.
+	if (scheduled && motor->m_speed_gain_active && conf_now->s_pid_ki >= 1e-9f) {
+		motor->m_speed_i_term += (motor->m_speed_gain_kp_prev - kp) * error / 20.0f;
+		if (kd == 0.0f && motor->m_speed_gain_kd_prev > 0.0f) {
+			motor->m_speed_i_term += motor->m_speed_d_filter;
+		}
+		utils_truncate_number_abs(&motor->m_speed_i_term, 1.0f);
+	}
+	motor->m_speed_gain_kp_prev = kp;
+	motor->m_speed_gain_kd_prev = kd;
+	motor->m_speed_gain_active = scheduled;
+
+	p_term = error * kp * (1.0f / 20.0f);
+	d_term = (error - motor->m_speed_prev_error) * (kd / dt) * (1.0f / 20.0f);
+	// D=0 must remove the old filtered D as well, not just its new input.
+	if (scheduled && kd == 0.0f) {
+		motor->m_speed_d_filter = 0.0f;
+	} else {
+		UTILS_LP_FAST(motor->m_speed_d_filter, d_term, conf_now->s_pid_kd_filter);
+	}
 	d_term = motor->m_speed_d_filter;
 
 	// Store previous error
@@ -596,6 +670,13 @@ float foc_correct_encoder(float obs_angle, float enc_angle, float speed,
 
 float foc_correct_hall(float angle, float dt, motor_all_state_t *motor, int hall_val) {
 	mc_configuration *conf_now = motor->m_conf;
+	if (foc_hall_speed_selected(conf_now) && !motor->m_phase_override) {
+		foc_speed_source_update(&motor->m_speed_source, conf_now->foc_hall_table, hall_val, dt,
+				RADPS2RPM_f(motor->m_pll_speed), RADPS2RPM_f(motor->m_speed_est_fast), conf_now->foc_sl_erpm);
+	} else {
+		motor->m_speed_source.initialized = false;
+	}
+
 	motor->m_hall_dt_diff_now += dt;
 
 	float rpm_abs = fabsf(RADPS2RPM_f(motor->m_pll_speed));
@@ -647,7 +728,10 @@ float foc_correct_hall(float angle, float dt, motor_all_state_t *motor, int hall
 			} else {
 				// The first transition has no complete interval. On reversal, retain the
 				// previous speed magnitude: returning to a boundary is not a full interval.
-				motor->m_hall_dt_diff_last = fabsf(motor->m_hall_dt_diff_last) * SIGN(diff);
+				// Keep a nonzero signed direction even when starting from rest.
+				// SIGN(-0.0f) is positive; retaining zero prevents reverse
+				// startup from ever acquiring a complete interval.
+				motor->m_hall_dt_diff_last = fmaxf(fabsf(motor->m_hall_dt_diff_last), dt) * SIGN(diff);
 			}
 
 			motor->m_hall_transition_angle_prev = motor->m_ang_hall;
@@ -677,7 +761,8 @@ float foc_correct_hall(float angle, float dt, motor_all_state_t *motor, int hall
 
 		motor->m_ang_hall_int_prev = ang_hall_int;
 
-		float rad_per_sec_hall = motor->m_hall_angle_diff_last / motor->m_hall_dt_diff_last;
+		float rad_per_sec_hall = fabsf(motor->m_hall_dt_diff_last) > 0.0f ?
+				motor->m_hall_angle_diff_last / motor->m_hall_dt_diff_last : 0.0f;
 		float rpm_abs_hall = fabsf(RADPS2RPM_f(rad_per_sec_hall));
 		float rpm_for_interp = rpm_abs_hall;
 		if (motor->m_hall_dt_diff_now > 0.0) {

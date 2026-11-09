@@ -637,6 +637,7 @@ bool mcpwm_foc_init_done(void) {
 
 void mcpwm_foc_set_configuration(mc_configuration *configuration) {
 	get_motor_now()->m_conf = configuration;
+	get_motor_now()->m_speed_source.initialized = false;
 	foc_precalc_values((motor_all_state_t*)get_motor_now());
 
 	// Below we check if anything in the configuration changed that requires stopping the motor.
@@ -1155,6 +1156,10 @@ mc_state mcpwm_foc_get_state_motor(bool is_second_motor) {
  * The RPM value.
  */
 float mcpwm_foc_get_rpm(void) {
+	volatile motor_all_state_t *motor = get_motor_now();
+	if (foc_hall_speed_selected((const mc_configuration*)motor->m_conf) && !motor->m_phase_override) {
+		return foc_selected_speed((const motor_all_state_t*)motor);
+	}
 	return RADPS2RPM_f(get_motor_now()->m_pll_speed);
 	//	return get_motor_now()->m_speed_est_fast * RADPS2RPM_f;
 }

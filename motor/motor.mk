@@ -1,5 +1,6 @@
 CSRC += \
 	motor/foc_math.c \
+	motor/foc_speed_source.c \
 	motor/mc_interface.c \
 	motor/mcpwm.c \
 	motor/mcpwm_foc.c \

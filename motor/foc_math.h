@@ -21,6 +21,7 @@
 #define FOC_MATH_H_
 
 #include "datatypes.h"
+#include "foc_speed_source.h"
 
 // Types
 typedef struct {
@@ -166,6 +167,7 @@ typedef struct {
 	observer_state m_observer_state;
 	float m_pll_phase;
 	float m_pll_speed;
+	foc_speed_source_t m_speed_source;
 	float m_speed_est_fast;
 	float m_speed_est_fast_corrected; // Same as m_speed_est_fast, but always based on the corrected position
 	float m_speed_est_faster;
@@ -221,6 +223,10 @@ typedef struct {
 	float m_speed_i_term;
 	float m_speed_prev_error;
 	float m_speed_d_filter;
+	float m_speed_gain_weight;
+	float m_speed_gain_kp_prev;
+	float m_speed_gain_kd_prev;
+	bool m_speed_gain_active;
 	int m_ang_hall_int_prev;
 	bool m_using_hall;
 	float m_ang_hall;
@@ -260,6 +266,9 @@ void foc_pll_run(float phase, float dt, float *phase_var,
 void foc_svm(float alpha, float beta, float max_mod, uint32_t PWMFullDutyCycle,
 		uint32_t* tAout, uint32_t* tBout, uint32_t* tCout, uint32_t *svm_sector);
 void foc_run_pid_control_pos(bool index_found, float dt, motor_all_state_t *motor);
+bool foc_hall_speed_selected(const mc_configuration *conf);
+float foc_selected_speed(const motor_all_state_t *motor);
+void foc_speed_pid_gains(const motor_all_state_t *motor, float *kp, float *kd);
 void foc_run_pid_control_speed(bool index_found, float dt, motor_all_state_t *motor);
 float foc_correct_encoder(float obs_angle, float enc_angle, float speed, float sl_erpm, motor_all_state_t *motor);
 float foc_correct_hall(float angle, float dt, motor_all_state_t *motor, int hall_val);

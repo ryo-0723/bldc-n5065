@@ -1022,8 +1022,6 @@ __attribute__((section(".text2"))) void terminal_process_string(char *str) {
 				bool is_second_motor = mc_interface_get_motor_thread() == 2;
 				int hall_last = utils_read_hall(is_second_motor, mcconf->m_hall_extra_samples);
 				float transitions[7] = {0.0};
-				uint8_t transition_from[7] = {0};
-				uint8_t transition_to[7] = {0};
 				int states[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
 				int transition_index = 0;
 
@@ -1033,10 +1031,7 @@ __attribute__((section(".text2"))) void terminal_process_string(char *str) {
 						int hall = utils_read_hall(is_second_motor, mcconf->m_hall_extra_samples);
 						if (hall_last != hall) {
 							if (transition_index < 7) {
-								transitions[transition_index] = phase;
-								transition_from[transition_index] = hall_last;
-								transition_to[transition_index] = hall;
-								transition_index++;
+								transitions[transition_index++] = phase;
 							}
 
 							for (int j = 0;j < 8;j++) {
@@ -1094,15 +1089,9 @@ __attribute__((section(".text2"))) void terminal_process_string(char *str) {
 						commands_printf("Found %d different states. Something is most likely wrong...\n", state_num);
 					}
 
-					commands_printf("Transition angles below are commanded electrical angles; rotor tracking is assumed.");
-					for (int i = 0; i < transition_index; i++) {
-						commands_printf("Hall transition %d: %d -> %d at %.1f degrees", i + 1,
-								transition_from[i], transition_to[i], (double)transitions[i]);
-					}
-
 					float min = 900.0;
 					float max = 0.0;
-					for (int i = 0; i + 1 < transition_index; i++) {
+					for (int i = 0;i < 6;i++) {
 						float diff = fabsf(utils_angle_difference(transitions[i], transitions[i + 1]));
 						commands_printf("Hall diff %d: %.1f degrees", i + 1, (double)diff);
 						if (diff < min) {
@@ -1114,9 +1103,7 @@ __attribute__((section(".text2"))) void terminal_process_string(char *str) {
 					}
 
 					float deviation = (max - min) / 2.0;
-					if (transition_index < 7) {
-						commands_printf("Not enough transitions for six interval measurements (%d of 7).", transition_index);
-					} else if (deviation < 5) {
+					if (deviation < 5) {
 						commands_printf("Maximum deviation: %.2f degrees. This is good alignment.\n", (double)deviation);
 					} else if ((max - min) < 10) {
 						commands_printf("Maximum deviation: %.2f degrees. This is OK, but not great alignment.\n", (double)deviation);
