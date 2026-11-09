@@ -143,9 +143,9 @@ else
 endif
 
 ifeq ($(OS),Windows_NT)
-  DEPPATH = build\$(PROJECT)\.dep
+  DEPPATH = $(subst /,\,$(BUILDDIR))\.dep
 else
-  DEPPATH = build/$(PROJECT)/.dep
+  DEPPATH = $(BUILDDIR)/.dep
 endif
 
 # Generate dependency information

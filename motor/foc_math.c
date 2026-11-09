@@ -599,8 +599,6 @@ float foc_correct_hall(float angle, float dt, motor_all_state_t *motor, int hall
 	motor->m_hall_dt_diff_now += dt;
 
 	float rpm_abs = fabsf(RADPS2RPM_f(motor->m_pll_speed));
-	float rad_per_sec_hall = (M_PI / 3.0) / motor->m_hall_dt_diff_last;
-	float rpm_abs_hall = fabsf(RADPS2RPM_f(rad_per_sec_hall));
 
 	motor->m_using_hall = rpm_abs < conf_now->foc_sl_erpm;
 	float angle_old = angle;
@@ -616,6 +614,9 @@ float foc_correct_hall(float angle, float dt, motor_all_state_t *motor, int hall
 			// Previous angle not valid
 			motor->m_ang_hall_int_prev = ang_hall_int;
 			motor->m_ang_hall = ang_hall_now;
+			motor->m_hall_dt_diff_now = 0.0;
+			motor->m_hall_angle_diff_last = 0.0;
+			motor->m_hall_transition_valid = false;
 		} else if (ang_hall_int != motor->m_ang_hall_int_prev) {
 			int diff = ang_hall_int - motor->m_ang_hall_int_prev;
 			if (diff > 100) {
@@ -624,52 +625,95 @@ float foc_correct_hall(float angle, float dt, motor_all_state_t *motor, int hall
 				diff += 200;
 			}
 
-			// This is only valid if the direction did not just change. If it did, we use the
-			// last speed together with the sign right now.
-			if (SIGN(diff) == SIGN(motor->m_hall_dt_diff_last)) {
-				if (diff > 0) {
-					motor->m_hall_dt_diff_last = motor->m_hall_dt_diff_now;
-				} else {
-					motor->m_hall_dt_diff_last = -motor->m_hall_dt_diff_now;
-				}
-			} else {
-				motor->m_hall_dt_diff_last = -motor->m_hall_dt_diff_last;
-			}
-
-			motor->m_hall_dt_diff_now = 0.0;
-
 			// A transition was just made. The angle is in the middle of the new and old angle.
-			int ang_avg = motor->m_ang_hall_int_prev + diff / 2;
-			ang_avg %= 200;
+			float ang_avg = motor->m_ang_hall_int_prev + diff * 0.5;
 
 			// Scale to the circle and convert to radians
-			motor->m_ang_hall = ((float)ang_avg / 200.0) * 2.0 * M_PI;
+			motor->m_ang_hall = (ang_avg / 200.0) * 2.0 * M_PI;
+			utils_norm_angle_rad(&motor->m_ang_hall);
+
+			// Match the elapsed time to the interval between consecutive transition angles,
+			// not the difference between Hall state centers. These midpoints approximate
+			// the boundaries until independently calibrated transition angles are available.
+			if (motor->m_hall_transition_valid &&
+					SIGN(diff) == SIGN(motor->m_hall_dt_diff_last)) {
+				float angle_diff = utils_angle_difference_rad(motor->m_ang_hall,
+						motor->m_hall_transition_angle_prev);
+				if (SIGN(angle_diff) == SIGN(diff) && fabsf(angle_diff) > 0.0 &&
+						motor->m_hall_dt_diff_now > 0.0) {
+					motor->m_hall_angle_diff_last = fabsf(angle_diff);
+					motor->m_hall_dt_diff_last = motor->m_hall_dt_diff_now * SIGN(diff);
+				}
+			} else {
+				// The first transition has no complete interval. On reversal, retain the
+				// previous speed magnitude: returning to a boundary is not a full interval.
+				motor->m_hall_dt_diff_last = fabsf(motor->m_hall_dt_diff_last) * SIGN(diff);
+			}
+
+			motor->m_hall_transition_angle_prev = motor->m_ang_hall;
+			motor->m_hall_transition_valid = true;
+			motor->m_hall_dt_diff_now = 0.0;
+
+			// Find the next center in the direction of travel. Hall state numbers are
+			// not ordered by angle, and the center spacing need not be 60 degrees.
+			int next_diff = 200;
+			for (int i = 0; i < 8; i++) {
+				if (conf_now->foc_hall_table[i] > 200) {
+					continue;
+				}
+				int center_diff = (conf_now->foc_hall_table[i] - ang_hall_int) * (diff > 0 ? 1 : -1);
+				if (center_diff <= 0) {
+					center_diff += 200;
+				}
+				if (center_diff > 0 && center_diff < next_diff) {
+					next_diff = center_diff;
+				}
+			}
+			motor->m_hall_interp_angle_limit = next_diff < 200 ?
+					((float)next_diff / 200.0) * M_PI : 0.0;
+			motor->m_hall_angle_diff_now = (fabsf((float)diff) / 200.0) * M_PI +
+					motor->m_hall_interp_angle_limit;
 		}
 
 		motor->m_ang_hall_int_prev = ang_hall_int;
 
-		if (RADPS2RPM_f((M_PI / 3.0) / fmaxf(fabsf(motor->m_hall_dt_diff_now),
-				fabsf(motor->m_hall_dt_diff_last))) < conf_now->foc_hall_interp_erpm) {
+		float rad_per_sec_hall = motor->m_hall_angle_diff_last / motor->m_hall_dt_diff_last;
+		float rpm_abs_hall = fabsf(RADPS2RPM_f(rad_per_sec_hall));
+		float rpm_for_interp = rpm_abs_hall;
+		if (motor->m_hall_dt_diff_now > 0.0) {
+			// A missing transition bounds speed using the width of the CURRENT
+			// interval. Reusing the previous width can disable interpolation early
+			// when entering a wider interval, even at constant speed.
+			rpm_for_interp = fminf(rpm_for_interp, RADPS2RPM_f(
+					motor->m_hall_angle_diff_now / motor->m_hall_dt_diff_now));
+		}
+
+		if (motor->m_hall_angle_diff_last <= 0.0 || motor->m_hall_interp_angle_limit <= 0.0 ||
+				rpm_for_interp < conf_now->foc_hall_interp_erpm) {
 			// Don't interpolate on very low speed, just use the closest hall sensor. The reason is that we might
 			// get stuck at 60 degrees off if a direction change happens between two steps.
 			motor->m_ang_hall = ang_hall_now;
 		} else {
 			// Interpolate
-			float diff = utils_angle_difference_rad(motor->m_ang_hall, ang_hall_now);
-			if (fabsf(diff) < ((2.0 * M_PI) / 12.0) || SIGN(diff) != SIGN(rad_per_sec_hall)) {
-				// Do interpolation
-				motor->m_ang_hall += rad_per_sec_hall * dt;
-			} else {
-				// We are too far away with the interpolation
-				motor->m_ang_hall -= diff * 0.01;
-			}
+			float direction = SIGN(rad_per_sec_hall);
+			float diff = utils_angle_difference_rad(motor->m_ang_hall, ang_hall_now) * direction;
+			float remaining = fmaxf(motor->m_hall_interp_angle_limit - diff, 0.0);
+			// Advance up to the estimated exit boundary, then hold. Pulling the
+			// angle back toward the center creates a false reverse speed pulse.
+			motor->m_ang_hall += direction * fminf(fabsf(rad_per_sec_hall) * dt, remaining);
 		}
 
 		utils_norm_angle_rad((float*)&motor->m_ang_hall);
 
 		// Limit hall sensor rate of change. This will reduce current spikes in the current controllers when the angle estimation
 		// changes fast.
-		float angle_step = (fmaxf(rpm_abs_hall, conf_now->foc_hall_interp_erpm) / 60.0) * 2.0 * M_PI * dt * 1.5;
+		float rate_limit_rpm = fmaxf(rpm_abs_hall, conf_now->foc_hall_interp_erpm);
+		if (motor->m_hall_angle_diff_last <= 0.0) {
+			// Before a full interval has been measured, keep the original initialization's
+			// 10 ERPM slew floor (60 degrees / 1 second), even if interpolation starts at 0.
+			rate_limit_rpm = fmaxf(rate_limit_rpm, 10.0);
+		}
+		float angle_step = (rate_limit_rpm / 60.0) * 2.0 * M_PI * dt * 1.5;
 		float angle_diff = utils_angle_difference_rad(motor->m_ang_hall, motor->m_ang_hall_rate_limited);
 		if (fabsf(angle_diff) < angle_step) {
 			motor->m_ang_hall_rate_limited = motor->m_ang_hall;
@@ -685,6 +729,8 @@ float foc_correct_hall(float angle, float dt, motor_all_state_t *motor, int hall
 	} else {
 		// Invalid hall reading. Don't update angle.
 		motor->m_ang_hall_int_prev = -1;
+		motor->m_hall_transition_valid = false;
+		motor->m_hall_angle_diff_last = 0.0;
 
 		// Also allow open loop in order to behave like normal sensorless
 		// operation. Then the motor works even if the hall sensor cable

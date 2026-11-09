@@ -227,6 +227,11 @@ typedef struct {
 	float m_ang_hall_rate_limited;
 	float m_hall_dt_diff_last;
 	float m_hall_dt_diff_now;
+	float m_hall_angle_diff_last; // Magnitude of the completed boundary-to-boundary interval, rad
+	float m_hall_angle_diff_now; // Estimated width of the interval currently being traversed, rad
+	float m_hall_interp_angle_limit; // Distance from the current center to the next boundary, rad
+	float m_hall_transition_angle_prev;
+	bool m_hall_transition_valid;
 	bool m_motor_released;
 
 	// Resistance observer
