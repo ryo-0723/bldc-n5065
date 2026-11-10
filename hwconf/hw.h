@@ -47,7 +47,7 @@
 #ifdef DISABLE_HW_LIMITS
 #define FW_NAME "no_hw_limits"
 #else
-#define FW_NAME ""
+#define FW_NAME "n5065_custom_61"
 #endif
 #endif
 
